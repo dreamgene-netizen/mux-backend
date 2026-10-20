@@ -5,7 +5,11 @@ import {
   ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
+
+/** Retry hint sent with every maintenance 503 when the row has no `retryAfterSeconds`. */
+export const DEFAULT_MAINTENANCE_RETRY_AFTER_SECONDS = 60;
 
 /**
  * Guard that blocks mutating requests when maintenance mode is enabled.
@@ -37,17 +41,17 @@ export class MaintenanceGuard implements CanActivate {
         `Maintenance mode enabled - rejecting ${method} request to ${request.url}`,
       );
       
+      const retryAfterSeconds =
+        maintenanceState.retryAfterSeconds ?? DEFAULT_MAINTENANCE_RETRY_AFTER_SECONDS;
       const error = new ServiceUnavailableException({
         code: 'MAINTENANCE_MODE',
         message: maintenanceState.message || 'Service temporarily unavailable for maintenance',
-        retryAfter: maintenanceState.retryAfterSeconds,
+        retryAfter: retryAfterSeconds,
       });
-      
-      // Set Retry-After header if configured
-      if (maintenanceState.retryAfterSeconds) {
-        request.res?.setHeader?.('Retry-After', maintenanceState.retryAfterSeconds.toString());
-      }
-      
+
+      // Set Retry-After on the response the exception filter writes to
+      context.switchToHttp().getResponse<Response>().setHeader('Retry-After', String(retryAfterSeconds));
+
       throw error;
     }
 
