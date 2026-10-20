@@ -1,4 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { BalanceIndexerService } from '../balance-indexer/balance-indexer.service';
 import { LimitsService } from '../limits/limits.service';
@@ -242,9 +248,10 @@ export class TransactionsService {
         updateDto.status,
       )
     ) {
-      throw new BadRequestException(
-        `Invalid status transition: ${existing.status} -> ${updateDto.status}`,
-      );
+      throw new ConflictException({
+        errorCode: 'TRANSACTION_STATUS_TRANSITION_INVALID',
+        message: `Invalid status transition: ${existing.status} -> ${updateDto.status}`,
+      });
     }
 
     const updateData: any = {
