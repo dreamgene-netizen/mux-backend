@@ -1,5 +1,13 @@
 import {
   BadRequestException,
+import { randomUUID } from 'crypto';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ConflictException,
+} from '@nestjs/common';
   Injectable,
   Logger,
   NotFoundException,
@@ -15,6 +23,7 @@ import {
   canTransitionTransactionStatus,
 } from './domain/transaction.model';
 import { Transaction as TransactionEntity } from './entities/transaction.entity';
+import { ErrorCode } from '../common/dto/error-envelope.dto';
 import { InsufficientBalanceException } from './domain/insufficient-balance.exception';
 import { WebhookEventEmitterService } from '../webhooks/webhook-event-emitter.service';
 import { WalletStatus } from '../wallets/domain/wallet.model';
@@ -44,8 +53,10 @@ export class TransactionsService {
    *
    * Enforces per-transaction and daily spending limits (fail-closed: 403)
    * before creating the record.  If an idempotencyKey is supplied and a
-   * transaction with that key already exists, the existing transaction is
-   * returned without side-effects.
+   * transaction with that key already exists for the same sender wallet, the
+   * existing transaction is returned without side-effects. A key already used
+   * by a different sender wallet is rejected with 409 (IDEMPOTENCY_CONFLICT)
+   * so another wallet's transaction is never exposed.
    *
    * The sender wallet must be owned by `callerDeveloperId` (taken from the API
    * key context, never the body) and both wallets must be ACTIVE. An ownership
@@ -55,6 +66,8 @@ export class TransactionsService {
     createTransactionDto: CreateTransactionDto,
     callerDeveloperId: string,
   ): Promise<TransactionEntity> {
+    this.assertValidAmount(createTransactionDto.amount);
+
     const {
       amount,
       asset,
@@ -70,6 +83,13 @@ export class TransactionsService {
         where: { idempotencyKey },
       });
       if (existing) {
+        if (existing.senderWalletId !== senderWalletId) {
+          throw new ConflictException({
+            message:
+              'Idempotency key is already used by another sender wallet',
+            errorCode: 'IDEMPOTENCY_CONFLICT',
+          });
+        }
         this.logger.log(
           `Idempotency hit for key ${idempotencyKey}, returning existing transaction ${existing.id}`,
         );
@@ -113,13 +133,29 @@ export class TransactionsService {
       }
     }
 
+    // A self-payment can never settle, so reject it before any balance,
+    // limit or write side effect
+    if (receiverWalletId && receiverWalletId === senderWalletId) {
+      throw new BadRequestException({
+        message: 'Sender and receiver wallet must differ',
+        errorCode: ErrorCode.TRANSACTION_SELF_PAYMENT,
+      });
+    }
+
     // Check sender has sufficient balance
     const balanceAsset: Asset = {
       type: asset.type as any,
       code: asset.code ?? undefined,
       issuer: asset.issuer ?? undefined,
     };
+    // The precheck runs as the sender wallet's owner, taken from the stored row
+    // rather than the request, so the indexer's ownership check still applies.
     const walletBalance = await this.balanceIndexer.getBalance(
+      {
+        subjectId: senderWallet.userId,
+        role: 'owner',
+        correlationId: randomUUID(),
+      },
       senderWalletId,
       balanceAsset,
     );
@@ -392,6 +428,26 @@ export class TransactionsService {
   }
 
   // ─── Private helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Reject amounts that are not a finite, strictly positive decimal string with
+   * at most 7 decimal places (Stellar precision). Runs before any balance or
+   * limit work so malformed values never reach those checks or the database.
+   */
+  private assertValidAmount(amount: string): void {
+    const value = Number(amount);
+    if (
+      typeof amount !== 'string' ||
+      !/^\d+(\.\d{1,7})?$/.test(amount) ||
+      !Number.isFinite(value) ||
+      value <= 0
+    ) {
+      throw new BadRequestException({
+        message: `Invalid transaction amount: ${amount}`,
+        errorCode: 'TRANSACTION_AMOUNT_INVALID',
+      });
+    }
+  }
 
   private async emitStatusWebhook(tx: any): Promise<void> {
     const status = tx.status as TransactionStatus;
